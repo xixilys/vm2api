@@ -8,6 +8,7 @@ import {
   flattenSearchResultHistory,
   flattenUndeclaredSearchHistory,
   pairMissingToolResults,
+  searchHistoryFingerprint,
   rectifyUnofficialRequest,
   rectifyUnofficialRequestForRetry,
 } from '../../src/lib/protocol/request-rectifier.mjs'
@@ -261,4 +262,115 @@ test('retry rectifier pairs tools then ends on user', () => {
   assert.equal(body.messages.length, 2)
   assert.equal(body.messages[1].role, 'user')
   assert.equal(body.messages[1].content[0].tool_use_id, 'toolu_x')
+})
+
+function mixedAdvisorSearchHistory() {
+  const body = serverSearchHistory([{ type: 'advisor_20260301', name: 'advisor', model: 'claude-fable-5-2' }])
+  body.messages[1].content.unshift(
+    { type: 'server_tool_use', id: 'advisor_1', name: 'advisor', input: {} },
+    {
+      type: 'advisor_tool_result',
+      tool_use_id: 'advisor_1',
+      content: { type: 'advisor_redacted_result', encrypted_content: 'ADVISOR_1' },
+    },
+    { type: 'server_tool_use', id: 'other_1', name: 'unknown', input: {} },
+    {
+      type: 'unknown_tool_result',
+      tool_use_id: 'other_1',
+      content: [{ type: 'unknown_encrypted_result', encrypted_content: 'UNKNOWN_1' }],
+    },
+  )
+  body.messages[1].content.push(
+    { type: 'server_tool_use', id: 'advisor_2', name: 'advisor', input: {} },
+    {
+      type: 'advisor_tool_result',
+      tool_use_id: 'advisor_2',
+      content: { type: 'advisor_redacted_result', encrypted_content: 'ADVISOR_2' },
+    },
+  )
+  return body
+}
+
+test('mixed search repair preserves multiple advisor and unknown encrypted server-tool pairs verbatim', () => {
+  for (const repair of [flattenSearchResultHistory, flattenUndeclaredSearchHistory, rectifyUnofficialRequest]) {
+    const body = mixedAdvisorSearchHistory()
+    const before = structuredClone(body)
+    const out = repair(body)
+    const blocks = out.messages[1].content
+    assert.deepEqual(blocks.slice(0, 4), before.messages[1].content.slice(0, 4))
+    assert.deepEqual(blocks.slice(-2), before.messages[1].content.slice(-2))
+    assert.deepEqual(
+      blocks.slice(4, 7).map((x) => x.type),
+      ['text', 'text', 'text'],
+    )
+    assert.deepEqual(out.tools, before.tools)
+    assert.deepEqual(body, before, 'input is not mutated')
+  }
+})
+
+test('search result IDs identify paired calls across messages, without flattening unrelated pending calls', () => {
+  const body = {
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'server_tool_use', id: 'search_1', name: 'legacy_search', input: { query: 'synthetic' } },
+          { type: 'server_tool_use', id: 'pending_advisor', name: 'advisor', input: {} },
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: 'search_1',
+            content: [
+              { type: 'web_search_result', title: 'A', encrypted_content: 'SEARCH_A' },
+              { type: 'web_search_result', title: 'B', encrypted_content: 'SEARCH_B' },
+            ],
+          },
+          { type: 'server_tool_use', id: 'pending_unknown', name: 'unknown', input: {} },
+        ],
+      },
+    ],
+  }
+  const out = flattenSearchResultHistory(body)
+  assert.equal(out.messages[0].content[0].type, 'text')
+  assert.deepEqual(out.messages[0].content[1], body.messages[0].content[1])
+  assert.equal(out.messages[1].content[0].type, 'text')
+  assert.deepEqual(out.messages[1].content[1], body.messages[1].content[1])
+  assert.ok(!JSON.stringify(out).includes('SEARCH_A'))
+  assert.ok(!JSON.stringify(out).includes('SEARCH_B'))
+})
+
+test('advisor-only and unknown encrypted histories are not search repair candidates', () => {
+  const mixed = mixedAdvisorSearchHistory()
+  const body = { messages: [{ role: 'assistant', content: mixed.messages[1].content.slice(0, 4) }] }
+  assert.equal(flattenSearchResultHistory(body), body)
+  assert.equal(flattenUndeclaredSearchHistory(body), body)
+  assert.equal(searchHistoryFingerprint(body), null)
+  // Opaque future server-tool payloads are not recursively treated as search.
+  body.messages[0].content.push({
+    type: 'future_tool_result',
+    tool_use_id: 'future',
+    content: [{ type: 'search_result', encrypted_content: 'OPAQUE_FUTURE_PAYLOAD' }],
+  })
+  assert.equal(flattenSearchResultHistory(body), body)
+  assert.equal(searchHistoryFingerprint(body), null)
+})
+
+test('Anthropic request preparation preserves advisor model and ciphertext on official and unofficial paths', () => {
+  for (const unofficial of [false, true]) {
+    const body = mixedAdvisorSearchHistory()
+    const out = prepareAnthropicRequest(body, { unofficial })
+    assert.deepEqual(out.tools, body.tools)
+    assert.deepEqual(out.messages[1].content.slice(0, 4), body.messages[1].content.slice(0, 4))
+    assert.deepEqual(out.messages[1].content.slice(-2), body.messages[1].content.slice(-2))
+    if (!unofficial) assert.deepEqual(out.messages, body.messages)
+    else
+      assert.deepEqual(
+        out.messages[1].content.slice(4, 7).map((block) => block.type),
+        ['text', 'text', 'text'],
+      )
+  }
 })

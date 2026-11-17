@@ -113,6 +113,7 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
   if (body.speed === 'fast' && Object.hasOwn(FAST_MODE_MODELS, model)) add('fast-mode-2026-02-01')
   if (Array.isArray(body.tools)) {
     for (const tool of body.tools) {
+      if (tool?.type === 'advisor_20260301') add('advisor-tool-2026-03-01')
       if (tool?.strict === true) add('structured-outputs-2025-12-15')
       if (tool?.defer_loading || String(tool?.type || '').startsWith('tool_search_tool_')) add(BETA_ADVANCED_TOOL_USE)
     }
@@ -142,6 +143,14 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
     let hasMessageTaskBudget = false
     for (const message of body.messages) {
       if (!message || typeof message !== 'object') continue
+      if (
+        Array.isArray(message.content) &&
+        message.content.some(
+          (block) =>
+            block?.type === 'advisor_tool_result' || (block?.type === 'server_tool_use' && block?.name === 'advisor'),
+        )
+      )
+        add('advisor-tool-2026-03-01')
       if (message.clear_at != null) hasClearAt = true
       if (contentHasInlineToolDefinition(message.content)) hasInlineToolDefinition = true
       const config = message.output_config

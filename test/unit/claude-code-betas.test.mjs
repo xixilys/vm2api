@@ -212,3 +212,47 @@ test('a tool_addition tool_definition appends inline-tools and nothing else does
     assert.ok(!withRequestProtocolBetas(['caller-beta'], { messages }).includes(beta))
   }
 })
+
+// Advisor is a server tool, not a client function. History still needs the beta
+// after a completed call's definition is removed (Anthropic advisor docs).
+test('advisor beta follows its definition, completed results and pending server calls', () => {
+  const beta = 'advisor-tool-2026-03-01'
+  const tool = { type: 'advisor_20260301', name: 'advisor', model: 'claude-fable-5-2' }
+  for (const body of [
+    { tools: [tool] },
+    { messages: [{ role: 'assistant', content: [{ type: 'server_tool_use', id: 'a', name: 'advisor', input: {} }] }] },
+    ...[
+      { type: 'advisor_result', text: 'synthetic advice' },
+      { type: 'advisor_redacted_result', encrypted_content: 'SYNTHETIC_ADVISOR' },
+      { type: 'advisor_tool_result_error', error_code: 'overloaded' },
+    ].map((content) => ({
+      messages: [{ role: 'assistant', content: [{ type: 'advisor_tool_result', tool_use_id: 'a', content }] }],
+    })),
+  ]) {
+    const before = structuredClone(body)
+    assert.ok(withRequestProtocolBetas([], body).includes(beta))
+    assert.equal(withRequestProtocolBetas(['caller-beta', beta, beta], body).filter((x) => x === beta).length, 1)
+    assert.deepEqual(body, before)
+  }
+  for (const body of [
+    {},
+    { model: 'claude-fable-5-2' },
+    { tools: [{ name: 'advisor', input_schema: { type: 'object' } }] },
+    { tools: [{ type: 'unknown_20261117', name: 'advisor' }] },
+    { tools: [{ type: 'web_search_20250305', name: 'web_search' }] },
+    { messages: [{ role: 'assistant', content: [{ type: 'tool_use', name: 'advisor', input: {} }] }] },
+    { messages: [{ role: 'assistant', content: [{ type: 'server_tool_use', name: 'unknown', input: {} }] }] },
+    { messages: [{ role: 'user', content: 'advisor_tool_result advisor_20260301' }] },
+  ])
+    assert.ok(!withRequestProtocolBetas([], body).includes(beta))
+})
+
+test('advisor request gate restores its beta after credential-mode headers are rebuilt', () => {
+  const body = { tools: [{ type: 'advisor_20260301', name: 'advisor', model: 'claude-fable-5-2' }] }
+  for (const header of [apiKeyBetaHeader(''), setupTokenBetaHeader('claude-opus-5-5'), DEFAULT_BETA_HEADER]) {
+    const tokens = header.split(',')
+    const betas = withRequestProtocolBetas(tokens, body)
+    assert.deepEqual(betas, [...tokens, 'advisor-tool-2026-03-01'])
+    assert.equal(withRequestProtocolBetas(tokens, {}).includes('advisor-tool-2026-03-01'), false)
+  }
+})

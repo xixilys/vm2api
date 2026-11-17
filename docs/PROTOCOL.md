@@ -85,6 +85,9 @@ system提示词页有两套。cli-node 仍用上面的模板。CRAG 一套只认
 官方 Claude Code 的 `agent_summary` 旁路只按当前完整摘要指令识别，沿用独立执行会话、席位与父会话粘性隔离。CRAG 的工具续接按工具 ID 认领，换 session ID 不会隔离继承的 `tool_result`：print 入核前，仅将已识别摘要的末条 user 消息中的工具结果展开为只读标签和原始内容块，保留正文、图片、错误标记、缓存断点及尾随 system 提示。历史工具调用/结果对与正常主请求保持原样；不靠匹配工具输出里的 `tool_result replayed` 文本触发清洗，不吞真实重放错误、不重发已消费结果。
 
 
+明确携带且能解析到父/root 账号的 companion 使用自己的会话席位，并保持父账号；只有同设备或最近会话记录不构成父关系。独立新会话的设备亲和仅作同等级、同席位占用率下的偏好。已有账号粘性与纯文本完整历史的有界容量借槽条件见 [调度快照与真实排队计时](performance/scheduler-admission.md#新会话设备与账号亲和)；工具、thinking、thread 和未知服务端状态不借账号，也不为借槽清理已有缓存。
+
+
 面板预览表达 Node 给出的模板内容；cli-hop 最终线序以上述 CLI-owned 前缀为准，不把 Node 对象预览当成最终 wire 抓包。更新 CLI 二进制后需要替换槽内副本并重启相应 kernel/CLI；配置热读不能让旧进程自动加载新 ELF。删除旧环境文本后首次前缀会冷写，后续 cache_read 数值须实测，不能保证必然不低于旧值。0注入 + 常驻约束关闭 + 无调用方 agent 的真实模型可见输出须单独验收。
 
 Go worker JSON 透传，不必因人设重建 worker。
@@ -161,9 +164,15 @@ CRAG 声明 `provider_managed_tools_v1` 且支持对应工具时使用独立的 
 - OpenAI `response_format` → `output_config`；`refusal` → `content_filter`
 - 空 refusal 记 `content_filter_refusal`
 
+### Advisor 托管工具
+
+工具定义 `type: advisor_20260301`、历史 `advisor_tool_result` 或 `name: advisor` 的 `server_tool_use` 会补齐 `advisor-tool-2026-03-01` beta；仅有同名客户端函数或普通文本不会触发。凭据模式重建 beta 头后仍按请求内容补齐，不全局启用该 beta，不改调用方的 advisor model 或内容。实际可用还要求槽内 native 数据面支持 advisor 定义及服务端工具历史；当前已知上游限制见 [#992](https://github.com/dofastted/vm2api/issues/992)，控制面补 beta 和保留内容不代表 advisor 已端到端可用。
+
+搜索修复只展开已识别的搜索调用、搜索结果及加密搜索块；跨消息的搜索结果 ID 可关联旧名称调用。Advisor 和未知托管工具的调用/结果、加密内容保持原样；只递归客户端 `tool_result`，不深入未知服务端工具的 opaque payload。只有 advisor 或未知工具的历史不产生搜索修复指纹。
+
 ## 搜索历史重放
 
-旧 `server_tool_use` / `web_search_tool_result` / 加密 `search_result` 被当前上游拒绝时，`search_repairable` 仍只在该请求内做一次纯文本修复重试；这不是 `slot_busy`，每个执行 lease 都在 hop 的 `finally` 释放，不清除原会话 pin。
+已识别的搜索 `server_tool_use` / `web_search_tool_result` / 加密 `search_result` 被当前上游拒绝时，`search_repairable` 仍只在该请求内做一次纯文本修复重试；这不是 `slot_busy`，每个执行 lease 都在 hop 的 `finally` 释放，不清除原会话 pin。
 
 若同一 VM / 账号 / 模型 / 凭据代际的修复跳确认成功，`FailoverRunner` 在进程内记录该入站会话的精确搜索历史和工具契约指纹。后续回合仅追加普通消息、指纹不变时，首跳直接复用既有修复，不再重复发送已知失败的历史。首次遇到、内容改变、新增搜索、不同会话或执行上下文均原样尝试；修复失败不记录。已知修复后来仍被拒绝时，返回真实错误并丢弃记录，不重发同一份展开体。
 

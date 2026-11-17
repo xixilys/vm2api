@@ -6,12 +6,7 @@
  */
 import { createHash } from 'node:crypto'
 import { stripIllegalCacheControlFields } from './cache-ttl.mjs'
-import {
-  blockHasEncryptedContent,
-  hasClaudeWebSearch,
-  historyHasWebSearchArtifacts,
-  isWebSearchArtifactBlock,
-} from './web-search.mjs'
+import { blockHasEncryptedContent, hasClaudeWebSearch, isWebSearchTool } from './web-search.mjs'
 
 export const CONTINUE_USER_TEXT = 'continue'
 export const MISSING_TOOL_RESULT_TEXT = 'Tool result unavailable.'
@@ -184,22 +179,32 @@ function searchArtifactText(block) {
   return `[search result] ${line}`
 }
 
-function isServerToolBlock(block) {
-  const type = String(block?.type || '')
-  if (type === 'server_tool_use') return true
-  return type !== 'tool_result' && type.endsWith('_tool_result')
-}
-
 const SEARCH_BLOCK_TYPES = new Set(['search_result', 'web_search_result'])
 
-/** Client tool_use / tool_result pairs are never flattened — only their inner search blocks. */
-function isFlattenableSearchBlock(block) {
-  if (isServerToolBlock(block)) return true
-  if (SEARCH_BLOCK_TYPES.has(String(block?.type || ''))) return blockHasEncryptedContent(block)
-  return typeof block?.encrypted_content === 'string'
+// Result IDs also identify legacy-named search calls in a different message.
+// Only descend into client tool_result; other server-tool payloads are opaque.
+function searchResultToolIds(body) {
+  const ids = new Set()
+  function collect(content, depth = 0) {
+    if (!Array.isArray(content) || depth > 4) return
+    for (const block of content) {
+      if (block?.type === 'web_search_tool_result' && block.tool_use_id) ids.add(block.tool_use_id)
+      if (block?.type === 'tool_result') collect(block.content, depth + 1)
+    }
+  }
+  for (const message of body.messages) collect(message?.content)
+  return ids
 }
 
-function flattenSearchBlocks(content, depth = 0) {
+/** Preserve advisor/unknown server tools, even when they carry encrypted content. */
+function isFlattenableSearchBlock(block, ids) {
+  const type = String(block?.type || '')
+  if (type === 'server_tool_use') return isWebSearchTool({ name: block.name }) || ids.has(block.id)
+  if (type === 'web_search_tool_result') return true
+  return SEARCH_BLOCK_TYPES.has(type) && blockHasEncryptedContent(block)
+}
+
+function flattenSearchBlocks(content, ids, depth = 0) {
   if (!Array.isArray(content) || depth > 4) return content
   const out = []
   let changed = false
@@ -208,13 +213,13 @@ function flattenSearchBlocks(content, depth = 0) {
       out.push(block)
       continue
     }
-    if (isFlattenableSearchBlock(block)) {
+    if (isFlattenableSearchBlock(block, ids)) {
       out.push({ type: 'text', text: searchArtifactText(block) })
       changed = true
       continue
     }
-    if (Array.isArray(block.content)) {
-      const nested = flattenSearchBlocks(block.content, depth + 1)
+    if (block.type === 'tool_result' && Array.isArray(block.content)) {
+      const nested = flattenSearchBlocks(block.content, ids, depth + 1)
       if (nested !== block.content) {
         out.push({ ...block, content: nested })
         changed = true
@@ -226,18 +231,23 @@ function flattenSearchBlocks(content, depth = 0) {
   return changed ? out : content
 }
 
-function messageNeedsFlatten(content, depth = 0) {
+function messageNeedsFlatten(content, ids, depth = 0) {
   if (!Array.isArray(content) || depth > 4) return false
-  return content.some((block) => isWebSearchArtifactBlock(block) || messageNeedsFlatten(block?.content, depth + 1))
+  return content.some(
+    (block) =>
+      isFlattenableSearchBlock(block, ids) ||
+      (block?.type === 'tool_result' && messageNeedsFlatten(block.content, ids, depth + 1)),
+  )
 }
 
 /** Match only the same search-bearing history and tool contract, never later conversation turns. */
 export function searchHistoryFingerprint(body = {}) {
   if (!Array.isArray(body.messages)) return null
+  const ids = searchResultToolIds(body)
   let hash = null
   for (let index = 0; index < body.messages.length; index++) {
     const message = body.messages[index]
-    if (!messageNeedsFlatten(message?.content)) continue
+    if (!messageNeedsFlatten(message?.content, ids)) continue
     hash ??= createHash('sha256')
     hash.update(JSON.stringify([index, message.role, message.content]))
     hash.update('\n')
@@ -254,10 +264,11 @@ export function searchHistoryFingerprint(body = {}) {
  */
 export function flattenSearchResultHistory(body = {}) {
   if (!Array.isArray(body.messages)) return body
+  const ids = searchResultToolIds(body)
   let changed = false
   const messages = body.messages.map((message) => {
-    if (!messageNeedsFlatten(message?.content)) return message
-    const content = flattenSearchBlocks(message.content)
+    if (!messageNeedsFlatten(message?.content, ids)) return message
+    const content = flattenSearchBlocks(message.content, ids)
     if (content === message.content) return message
     changed = true
     return {
@@ -275,7 +286,7 @@ export function flattenSearchResultHistory(body = {}) {
  * server_tool_use as "not defined in `tools` as a server tool", so it becomes text.
  */
 export function flattenUndeclaredSearchHistory(body = {}) {
-  if (hasClaudeWebSearch(body.tools) || !historyHasWebSearchArtifacts(body)) return body
+  if (hasClaudeWebSearch(body.tools)) return body
   return flattenSearchResultHistory(body)
 }
 
