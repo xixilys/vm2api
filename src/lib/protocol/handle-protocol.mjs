@@ -1300,10 +1300,20 @@ export function createHandleProtocol(deps) {
         }).body,
       )
     }
-    const isProbe = isParentSessionCompanion(inbound) || isParentSessionCompanion(ctx.body)
+    const parentSession = explicitParentSessionId(inbound, req.headers)
+    const companion = isParentSessionCompanion(inbound) || isParentSessionCompanion(ctx.body)
+    // Recency on the same device is only a hint, never a parent relation.
+    // A companion needs both a distinct session and an explicitly resolved parent.
+    const companionParent =
+      companion && parentSession && inboundIdentity.sessionId && parentSession !== inboundIdentity.sessionId
+        ? stickyRouter?.resolve?.(stickyRouter?.canonicalFamilyKey?.(parentSession)) ||
+          stickyRouter?.resolve?.(stickyRouter?.canonicalSessionKey?.(parentSession))
+        : null
+    const trustedCompanion = !!(companionParent?.vmId && companionParent.accountId)
+    const isProbe = companion && !trustedCompanion
     // One-shot test calls (sub2api account test, new-api channel test) keep their
     // sticky identity but never hold a session seat the main conversation needs.
-    const seatless = isProbe || isShortProbeRequest(inbound)
+    const seatless = !trustedCompanion && (isProbe || isShortProbeRequest(inbound))
     // Seat = this client session. Same device, other session = other slot.
     const seatKey = seatless
       ? null
@@ -1327,7 +1337,6 @@ export function createHandleProtocol(deps) {
     const stickyKey = sessionKeys.stickyKey || null
     const stickyKeys = sessionKeys.stickyKeys || []
     const deviceKey = stickyDeviceId ? stickyRouter?.canonicalDeviceKey?.(stickyDeviceId) || null : null
-    const parentSession = explicitParentSessionId(inbound, req.headers)
     const familySession = parentSession || callerSession
     const familyTrusted =
       !!parentSession || (!!inboundIdentity.sessionId && familySession === inboundIdentity.sessionId)
@@ -1336,7 +1345,9 @@ export function createHandleProtocol(deps) {
       : stickyRouter?.familyPoolKey
         ? stickyRouter.familyPoolKey(req, familySession, { trusted: familyTrusted })
         : stickyRouter?.familyKey?.(req, familySession, 'anthropic') || null
-    const familyVmId = familyKey ? stickyRouter?.resolve?.(familyKey)?.vmId || null : null
+    const familyVmId = familyKey
+      ? stickyRouter?.resolve?.(familyKey)?.vmId || (trustedCompanion ? companionParent.vmId : null)
+      : null
     const stickyBound =
       stickyKey && typeof stickyRouter?.resolve === 'function' ? stickyRouter.resolve(stickyKey) : null
     const outboundSessionId = resolveOutboundSessionId(executionSession, {

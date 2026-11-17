@@ -2915,8 +2915,8 @@ test('Claude follow-ups keep their VM and outbound session after another VM gain
   const stickyKey = sticky.canonicalSessionKey(caller)
   const familyKey = sticky.canonicalFamilyKey(caller)
   const deviceKey = sticky.canonicalDeviceKey('seated-machine')
-  sticky.bind(familyKey, { accountId: 'account-1', vmId: 'vm-01' }, { countHit: false })
-  sticky.bindDeviceAffinity(deviceKey, { accountId: 'account-2', vmId: 'vm-02' })
+  sticky.bind(familyKey, { accountId: 'account-2', vmId: 'vm-02' }, { countHit: false })
+  sticky.bindDeviceAffinity(deviceKey, { accountId: 'account-1', vmId: 'vm-01' })
   const runtimeRepo = new RuntimeRepo()
   const makeRunner = () =>
     new FailoverRunner({ scheduler: scheduler(root, { stickyRouter: sticky, runtimeRepo }), stickyRouter: sticky })

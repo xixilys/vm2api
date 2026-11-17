@@ -1602,3 +1602,56 @@ unixTest('API OpenAI flushes buffered metadata with the first real output', asyn
   assert.match(run.wire, /response\.output_text\.delta/)
   assert.match(run.wire, /response\.completed/)
 })
+
+test('trusted companion with explicit parent or root gets its own seat on the resolved parent account', async () => {
+  const { dir, router } = realStickyRouter()
+  try {
+    router.bind('sess:parent-companion', { accountId: 'acc-parent', vmId: 'vm-parent', slotIndex: 0 })
+    const parentBefore = router.resolve('sess:parent-companion')
+    // A canonical parent pin alone suffices; do not require a migrated family row.
+    for (const relation of ['parent_session_id', 'root_session_id']) {
+      const body = companionHaikuBody('child-' + relation, 'dev-companion')
+      body.metadata.user_id = JSON.stringify({
+        device_id: 'dev-companion',
+        session_id: 'child-' + relation,
+        [relation]: 'parent-companion',
+      })
+      const opts = await captureRunOpts({ body, stickyRouter: router })
+      assert.equal(opts.skipSessionSeat, false)
+      assert.equal(opts.seatKey, 'seat:sess:child-' + relation)
+      assert.equal(opts.stickyKey, 'sess:child-' + relation)
+      assert.deepEqual(opts.stickyKeys, [opts.stickyKey])
+      assert.equal(opts.familyKey, 'family2:parent-companion')
+      assert.equal(opts.familyVmId, 'vm-parent')
+      assert.deepEqual(router.resolve('sess:parent-companion'), parentBefore)
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('companion without a resolved distinct explicit parent never infers family from device', async () => {
+  const { dir, router } = realStickyRouter()
+  try {
+    router.bind('sess:device-neighbor', { accountId: 'acc-neighbor', vmId: 'vm-neighbor', deviceId: 'same-device' })
+    router.bind('dev2:same-device', { accountId: 'acc-neighbor', vmId: 'vm-neighbor' })
+    router.latestParentPoolKey = () => {
+      throw new Error('device recency is not a trusted parent')
+    }
+    for (const parent of [null, 'unresolved-parent', 'companion-own']) {
+      const body = companionHaikuBody('companion-own', 'same-device')
+      body.metadata.user_id = JSON.stringify({
+        device_id: 'same-device',
+        session_id: 'companion-own',
+        ...(parent ? { parent_session_id: parent } : {}),
+      })
+      const opts = await captureRunOpts({ body, stickyRouter: router })
+      assert.equal(opts.skipSessionSeat, true)
+      assert.equal(opts.seatKey, null)
+      assert.equal(opts.stickyKey, null)
+      assert.notEqual(opts.familyVmId, 'vm-neighbor')
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

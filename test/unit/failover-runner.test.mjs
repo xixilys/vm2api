@@ -2372,3 +2372,79 @@ test('signature 400 without foreign thinking still surfaces with the switch off'
   assert.equal(result.status, 400)
   assert.equal(calls, 1)
 })
+
+test('capacity borrow permission is canonical own-root only and expires after any upstream execution', async (t) => {
+  for (const kind of [
+    'own-root',
+    'child',
+    'companion',
+    'diagnostic',
+    'unknown-key',
+    'other-seat',
+    'unbound-family',
+    'family-hint',
+  ]) {
+    await t.test(kind, async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-capacity-lineage-'))
+      try {
+        const sticky = new StickyRouter({ dataDir: dir, config: { sticky: { enabled: true, ttl_seconds: 600 } } })
+        sticky.bind('sess:root', { vmId: 'vm-01', accountId: 'account-1' })
+        sticky.bind('family2:root', { vmId: 'vm-01', accountId: 'account-1' })
+        const scheduler = new Scheduler([candidate(1), candidate(2)])
+        const observed = []
+        const original = scheduler.selectAndReserve.bind(scheduler)
+        scheduler.selectAndReserve = async (args) => {
+          observed.push(args.capacityBorrowAllowed)
+          return original(args)
+        }
+        const runner = new FailoverRunner({
+          scheduler,
+          stickyRouter: sticky,
+          config: { same_account_retry_delay_ms: 0 },
+        })
+        let calls = 0
+        const result = await runner.run({
+          requestId: 'capacity-lineage-' + kind,
+          canonicalBody: {
+            model: 'claude-test',
+            messages: [
+              { role: 'user', content: 'a' },
+              { role: 'assistant', content: 'b' },
+              { role: 'user', content: 'c' },
+            ],
+          },
+          model: 'claude-test',
+          stickyKey: kind === 'unknown-key' ? 'legacy-root' : 'sess:root',
+          seatKey: kind === 'other-seat' ? 'seat:sess:other' : 'seat:sess:root',
+          familyKey:
+            kind === 'child'
+              ? 'family2:parent'
+              : kind === 'unbound-family'
+                ? 'family2:missing'
+                : kind === 'family-hint'
+                  ? null
+                  : 'family2:root',
+          familyVmId: 'vm-01',
+          skipSessionSeat: kind === 'companion',
+          pinVmId: kind === 'diagnostic' ? 'vm-01' : null,
+          callAttempt: async () => {
+            calls++
+            return calls === 1
+              ? {
+                  ok: false,
+                  status: 529,
+                  terminalState: 'rejected',
+                  body: { error: { type: 'overloaded_error', message: 'busy' } },
+                }
+              : success()
+          },
+        })
+        assert.equal(result.ok, true)
+        assert.equal(observed[0], kind === 'own-root')
+        assert.ok(observed.slice(1).every((value) => value === false))
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    })
+  }
+})

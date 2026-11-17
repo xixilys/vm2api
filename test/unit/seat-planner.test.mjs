@@ -315,7 +315,7 @@ test('a restarted scheduler does not turn a seatless probe sticky row into a sea
   restarted.planner.free(restarted.planner.seatOf(planned('real-session')))
 })
 
-test('a machine keeps one VM; its next session takes a free slot there and a foreign session does not', async (t) => {
+test('one device balances independent sessions; a full pool queues globally without a device wait', async (t) => {
   const pool = setup(
     t,
     [
@@ -330,33 +330,31 @@ test('a machine keeps one VM; its next session takes a free slot there and a for
   assert.equal(first.selectionReason, 'device-affinity')
   const sibling = await seat(pool, 'sess-b', { deviceVmId: 'vm-01' })
   assert.equal(sibling.ok, true)
-  assert.equal(sibling.vmId, 'vm-01')
-  assert.equal(sibling.selectionReason, 'device-affinity')
-  assert.equal(pool.planner.openCount('vm-01'), 2)
-  assert.equal(pool.planner.openCount('vm-02'), 0)
+  assert.equal(sibling.vmId, 'vm-02')
+  assert.equal(pool.planner.openCount('vm-01'), 1)
+  assert.equal(pool.planner.openCount('vm-02'), 1)
   const foreign = await seat(pool, 'sess-other', { deviceVmId: 'vm-02', allowWait: false })
   assert.equal(foreign.ok, true)
   assert.equal(foreign.vmId, 'vm-02')
-  // The machine's VM is full: queue on it. Do not grant another VM before the sticky wait.
-  let granted = false
-  const crowded = seat(pool, 'sess-c', { deviceVmId: 'vm-01' }).then((hold) => ((granted = true), hold))
-  await waitFor(() => (pool.planner.vmQueues.get('vm-01') || []).some((ticket) => ticket.seatKey === planned('sess-c')))
-  await new Promise((resolve) => setTimeout(resolve, 40))
-  assert.equal(granted, false)
-  assert.equal(pool.planner.globalQueue.length, 0)
+  const last = await seat(pool, 'sess-last', { deviceVmId: 'vm-01', allowWait: false })
+  assert.equal(last.vmId, 'vm-01')
+  const crowded = seat(pool, 'sess-c', { deviceVmId: 'vm-01' })
+  await waitFor(() => pool.planner.globalQueue.some((ticket) => ticket.seatKey === planned('sess-c')))
+  assert.equal(pool.planner.vmQueues.get('vm-01')?.length || 0, 0)
+  foreign.release()
   const got = await crowded
   assert.equal(got.ok, true)
   assert.equal(got.vmId, 'vm-02')
   assert.notEqual(got.selectionReason, 'device-affinity')
   first.release()
   sibling.release()
-  foreign.release()
+  last.release()
   got.release()
   assert.equal(pool.planner.openCount('vm-01'), 0)
   assert.equal(pool.planner.openCount('vm-02'), 0)
 })
 
-test('two first sessions of one machine claim the same VM before sticky affinity is written', async (t) => {
+test('concurrent independent sessions balance before the device sticky write completes', async (t) => {
   const root = project([
     { id: 'vm-01', policy: { sessionSlots: 2 } },
     { id: 'vm-02', policy: { sessionSlots: 2 } },
@@ -378,6 +376,11 @@ test('two first sessions of one machine claim the same VM before sticky affinity
   }
   const runner = new FailoverRunner({ scheduler: pool, stickyRouter: sticky })
   const deviceKey = sticky.canonicalDeviceKey('machine-1')
+  let releaseReplies
+  const replies = new Promise((resolve) => {
+    releaseReplies = resolve
+  })
+  t.after(() => releaseReplies())
   const run = (sessionId) =>
     runner.run({
       requestId: sessionId,
@@ -387,19 +390,29 @@ test('two first sessions of one machine claim the same VM before sticky affinity
       seatKey: `seat:sess:${sessionId}`,
       deviceKey,
       stickyDeviceId: 'machine-1',
-      callAttempt: async () => ({
-        ok: true,
-        status: 200,
-        terminalState: 'verified',
-        body: { type: 'message', content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: {} },
-      }),
+      callAttempt: async () => {
+        await replies
+        return {
+          ok: true,
+          status: 200,
+          terminalState: 'verified',
+          body: { type: 'message', content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: {} },
+        }
+      },
     })
-  const [a, b] = await Promise.all([run('sess-a'), run('sess-b')])
+  const running = Promise.all([run('sess-a'), run('sess-b')])
+  await waitFor(() => pool.planner.seats.size === 2)
+  assert.equal(pool.planner.openCount('vm-01'), 1)
+  assert.equal(pool.planner.openCount('vm-02'), 1)
+  releaseReplies()
+  const [a, b] = await running
   assert.equal(a.ok && b.ok, true)
-  assert.equal(a.vmId, b.vmId)
+  assert.notEqual(a.vmId, b.vmId)
   assert.equal(pool.planner.openCount(a.vmId), 0)
   assert.equal(pool.planner.openCount(a.vmId === 'vm-01' ? 'vm-02' : 'vm-01'), 0)
-  assert.equal(sticky.resolve(deviceKey)?.vmId, a.vmId)
+  assert.ok([a.vmId, b.vmId].includes(sticky.resolve(deviceKey)?.vmId))
+  assert.equal(sticky.resolve(sticky.canonicalSessionKey('sess-a')).vmId, a.vmId)
+  assert.equal(sticky.resolve(sticky.canonicalSessionKey('sess-b')).vmId, b.vmId)
 })
 
 test('an expired or unbound machine affinity does not send the next session back to the old VM', async (t) => {
@@ -695,7 +708,11 @@ test('a sticky seat wait leaves a home VM that stopped being eligible', async (t
   const heldB = await seat(pool, 'b', { deviceVmId: 'vm-02' })
   assert.equal(heldA.vmId, 'vm-01')
   assert.equal(heldB.vmId, 'vm-02')
-  const waiting = seat(pool, 'c', { deviceVmId: 'vm-01' })
+  pool.stickyRouter = {
+    resolve: (key) => (key === 'sess:c' ? { vmId: 'vm-01', accountId: 'account-1' } : null),
+    unbind() {},
+  }
+  const waiting = seat(pool, 'c', { stickyKey: 'sess:c', deviceVmId: 'vm-01' })
   await waitFor(() => (pool.planner.vmQueues.get('vm-01') || []).some((ticket) => ticket.seatKey === planned('c')))
   pool.runtimeRepo.upsert({ account_id: 'account-1', rate_limit_reset_at: Date.now() + 60_000 })
   await waitFor(() => pool.planner.globalQueue.some((ticket) => ticket.seatKey === planned('c')), 4500)
@@ -876,7 +893,7 @@ test('new seats exhaust the highest priority tier before using a lower affinity 
     { id: 'vm-03', policy: { priority: 10, sessionSlots: 1 } },
   ])
   setUtil5h(quota, 'account-2', 0.78)
-  const options = { deviceVmId: 'vm-01', familyVmId: 'vm-01', allowWait: false }
+  const options = { deviceVmId: 'vm-01', allowWait: false }
   const first = await seat(pool, 'first', options)
   assert.equal(first.vmId, 'vm-03')
   const next = await seat(pool, 'next', options)
@@ -927,4 +944,529 @@ test('a global waiter places its new seat by priority, not by the VM pumped firs
   const granted = await queued
   assert.equal(granted.vmId, 'vm-02')
   granted.release()
+})
+
+test('independent sessions on one device balance by occupied seat ratio', async (t) => {
+  const pool = setup(t, [
+    { id: 'vm-01', policy: { sessionSlots: 2 } },
+    { id: 'vm-02', policy: { sessionSlots: 2 } },
+  ])
+  const first = await seat(pool, 'independent-a', { deviceVmId: 'vm-01', allowWait: false })
+  t.after(() => first.release())
+  const second = await seat(pool, 'independent-b', { deviceVmId: 'vm-01', allowWait: false })
+  t.after(() => second.release?.())
+  assert.equal(first.vmId, 'vm-01', 'device affinity breaks an initial occupancy tie')
+  assert.equal(second.vmId, 'vm-02', 'a device is not a parent/root relationship')
+  assert.equal(pool.planner.openCount('vm-01'), 1)
+  assert.equal(pool.planner.openCount('vm-02'), 1)
+})
+
+test('independent session does not wait on a full device home while another VM is free', async (t) => {
+  const pool = setup(t, [
+    { id: 'vm-01', policy: { sessionSlots: 1 } },
+    { id: 'vm-02', policy: { sessionSlots: 1 } },
+  ])
+  const first = await seat(pool, 'full-device-home', { deviceVmId: 'vm-01', allowWait: false })
+  t.after(() => first.release())
+  const second = await seat(pool, 'independent-overflow', { deviceVmId: 'vm-01', allowWait: false })
+  t.after(() => second.release?.())
+  assert.equal(second.ok, true)
+  assert.equal(second.vmId, 'vm-02')
+  assert.equal(pool.planner.seatOf(planned('full-device-home')).vmId, 'vm-01')
+})
+
+test('independent device preference does not override actual unequal seat capacities', async (t) => {
+  const pool = setup(t, [
+    { id: 'vm-01', policy: { sessionSlots: 2 } },
+    { id: 'vm-02', policy: { sessionSlots: 4 } },
+  ])
+  const first = await seat(pool, 'capacity-a', { deviceVmId: 'vm-01', allowWait: false })
+  const second = await seat(pool, 'capacity-b', { deviceVmId: 'vm-02', allowWait: false })
+  t.after(() => {
+    first.release()
+    second.release()
+  })
+  const third = await seat(pool, 'capacity-c', { deviceVmId: 'vm-01', allowWait: false })
+  t.after(() => third.release?.())
+  assert.equal(third.vmId, 'vm-02', '1/4 is less occupied than 1/2')
+})
+
+test('trusted family home outranks device affinity and uses a distinct child seat', async (t) => {
+  const pool = setup(t, [
+    { id: 'vm-01', policy: { sessionSlots: 2 } },
+    { id: 'vm-02', policy: { sessionSlots: 2 } },
+  ])
+  const parent = await seat(pool, 'family-parent', { deviceVmId: 'vm-02', allowWait: false })
+  t.after(() => parent.release())
+  const child = await seat(pool, 'family-child', {
+    deviceVmId: 'vm-01',
+    familyVmId: parent.vmId,
+    allowWait: false,
+  })
+  t.after(() => child.release?.())
+  assert.equal(child.vmId, parent.vmId)
+  assert.notEqual(child.slotIndex, parent.slotIndex)
+  assert.equal(pool.planner.openCount(parent.vmId), 2)
+})
+
+test('trusted family with a full home cannot spill a child to another account', async (t) => {
+  const pool = setup(t, [
+    { id: 'vm-01', policy: { sessionSlots: 1 } },
+    { id: 'vm-02', policy: { sessionSlots: 1 } },
+  ])
+  const parent = await seat(pool, 'full-family-parent', { deviceVmId: 'vm-01', allowWait: false })
+  t.after(() => parent.release())
+  const child = await seat(pool, 'full-family-child', { familyVmId: parent.vmId, allowWait: false })
+  t.after(() => child.release?.())
+  assert.equal(child.ok, false)
+  assert.equal(pool.planner.openCount('vm-02'), 0)
+  assert.equal(pool.planner.seatOf(planned('full-family-parent')).vmId, parent.vmId)
+})
+
+test('trusted family times out on its account rather than entering a global spill queue', async (t) => {
+  const pool = setup(
+    t,
+    [
+      { id: 'vm-01', policy: { priority: 1, sessionSlots: 1 } },
+      { id: 'vm-02', policy: { priority: 10, sessionSlots: 1 } },
+    ],
+    { sticky: 40, fallback: 200 },
+  )
+  const parent = await seat(pool, 'waiting-parent', { familyVmId: 'vm-01', allowWait: false })
+  t.after(() => parent.release())
+  const child = await seat(pool, 'waiting-child', { familyVmId: 'vm-01', deadline: Date.now() + 150 })
+  assert.equal(child.ok, false)
+  assert.equal(child.reason, 'pool_queue_timeout')
+  assert.equal(pool.planner.openCount('vm-02'), 0)
+  assert.equal(pool.planner.seatOf(planned('waiting-parent')).vmId, 'vm-01')
+})
+
+test('global device waiter ranks free seats by occupancy, not by which VM was pumped first', async (t) => {
+  const pool = setup(t, [
+    { id: 'vm-01', policy: { sessionSlots: 2 } },
+    { id: 'vm-02', policy: { sessionSlots: 4 } },
+  ])
+  const held = []
+  for (let i = 0; i < 6; i++) held.push(await seat(pool, `global-held-${i}`, { allowWait: false }))
+  t.after(() => {
+    for (const hold of held) hold.release()
+  })
+  const queued = seat(pool, 'global-device', { deviceVmId: 'vm-01' })
+  await waitFor(() => pool.planner.globalQueue.length === 1)
+  const pump = pool.planner.pump
+  pool.planner.pump = () => {}
+  for (const vmId of ['vm-01', 'vm-02']) {
+    for (const hold of held.filter((hold) => hold.vmId === vmId).slice(1)) hold.release()
+  }
+  // A live new ticket retains its module's private rank helper if method
+  // installation is rolled back; no new prototype helper is required.
+  pool.enqueueTicket = () => {
+    throw new Error('a retained ticket must not be recreated')
+  }
+  assert.equal(Object.hasOwn(PoolScheduler.prototype, 'rankNewSeats'), false)
+  pool.planner.pump = pump
+  pool.planner.pump('vm-01')
+  const granted = await queued
+  t.after(() => granted.release())
+  assert.equal(granted.vmId, 'vm-02', '1/4 beats 1/2 even though device home was pumped first')
+})
+
+test('suspended v130 homes calls preserve explicit family and ambiguous device homes after method switch', async (t) => {
+  const pool = setup(t, [
+    { id: 'vm-01', policy: { sessionSlots: 2 } },
+    { id: 'vm-02', policy: { sessionSlots: 2 } },
+  ])
+  const candidates = await pool.eligibleCandidates({ model: MODEL })
+  let resume
+  const gate = new Promise((resolve) => {
+    resume = resolve
+  })
+  const suspended = async () => {
+    await gate
+    // Exact arguments emitted by the original selectSeat body after await.
+    return pool.openNewSeat(planned('legacy-family'), candidates, {
+      avoided: () => false,
+      homes: [
+        { vmId: 'vm-01', reason: 'device-affinity' },
+        { vmId: 'vm-02', reason: 'family-affinity' },
+      ],
+      stickyHome: null,
+      deviceKey: '',
+    })
+  }
+  const pending = suspended()
+  resume()
+  const family = await pending
+  t.after(() => family.reservation.release())
+  assert.equal(family.candidate.vmId, 'vm-02')
+  const ambiguous = pool.openNewSeat(planned('legacy-ambiguous'), candidates, {
+    avoided: () => false,
+    homes: [{ vmId: 'vm-02', reason: 'device-affinity' }],
+  })
+  t.after(() => ambiguous.reservation.release())
+  assert.equal(ambiguous.candidate.vmId, 'vm-02', 'old deduplicated family cannot be guessed to be independent')
+  const full = pool.openNewSeat(planned('legacy-full'), candidates, {
+    avoided: () => false,
+    homes: [{ vmId: 'vm-02', reason: 'device-affinity' }],
+  })
+  assert.equal(full, null, 'an ambiguous suspended frame retains the original home-full behaviour')
+})
+
+test('a new selectSeat frame supplies an account home to the original openNewSeat call shape on rollback', async (t) => {
+  const pool = setup(t, [
+    { id: 'vm-01', policy: { sessionSlots: 2 } },
+    { id: 'vm-02', policy: { sessionSlots: 2 } },
+  ])
+  const current = pool.openNewSeat
+  pool.openNewSeat = function (seatKey, candidates, opts) {
+    // The original method ignores new options, but honours stickyHome before homes.
+    assert.equal(opts.stickyHome.vmId, 'vm-02')
+    return current.call(this, seatKey, candidates, {
+      avoided: opts.avoided,
+      homes: opts.homes,
+      stickyHome: opts.stickyHome,
+      deviceKey: opts.deviceKey,
+    })
+  }
+  const child = await seat(pool, 'rollback-child', { deviceVmId: 'vm-01', familyVmId: 'vm-02', allowWait: false })
+  t.after(() => child.release())
+  assert.equal(child.vmId, 'vm-02')
+})
+
+function capacityHistory() {
+  return {
+    model: MODEL,
+    metadata: {
+      user_id: JSON.stringify({
+        session_id: 'capacity-turn',
+        device_id: 'capacity-device',
+        account_uuid: 'caller-identity',
+      }),
+    },
+    max_tokens: 32,
+    thinking: { type: 'disabled' },
+    messages: [
+      { role: 'user', content: 'The sentinel is violet.' },
+      { role: 'assistant', content: 'ACK' },
+      { role: 'user', content: 'Which sentinel?' },
+    ],
+  }
+}
+
+function capacityQuota(body = capacityHistory()) {
+  return { body }
+}
+
+async function capacityPool(t, extraSpecs = []) {
+  const pool = setup(
+    t,
+    [{ id: 'vm-01', policy: { sessionSlots: 1 } }, { id: 'vm-02', policy: { sessionSlots: 1 } }, ...extraSpecs],
+    { sticky: 45000 },
+  )
+  const original = pool.eligibleCandidates.bind(pool)
+  pool.eligibleCandidates = async (args) => {
+    const candidates = await original(args)
+    for (const c of candidates) {
+      c.dataPath = 'direct'
+      c.vm.dataplane = 'wrap'
+    }
+    return candidates
+  }
+  const blocker = await seat(pool, 'capacity-blocker', { deviceVmId: 'vm-01', allowWait: false })
+  t.after(() => blocker.release())
+  const sticky = new StickyRouter({
+    dataDir: pool.projectRoot,
+    config: { sticky: { enabled: true, ttl_seconds: 600 } },
+  })
+  sticky.bind('sess:capacity-turn', { accountId: 'account-1', vmId: 'vm-01', sessionId: 'original-cli-session' })
+  sticky.bind('family2:capacity-turn', { accountId: 'account-1', vmId: 'vm-01' })
+  pool.stickyRouter = sticky
+  return pool
+}
+
+test('capacity replay borrows after half remaining budget despite direct singleton and preserves home', async (t) => {
+  const pool = await capacityPool(t)
+  const home = pool.stickyRouter.resolve('sess:capacity-turn')
+  const family = pool.stickyRouter.resolve('family2:capacity-turn')
+  const spilled = new Set()
+  const start = Date.now()
+  const result = await seat(pool, 'capacity-turn', {
+    stickyKey: 'sess:capacity-turn',
+    familyVmId: 'vm-01',
+    quotaRequest: capacityQuota(),
+    capacityBorrowAllowed: true,
+    spilled,
+    deadline: start + 240,
+  })
+  t.after(() => result.release?.())
+  assert.equal(result.ok, true)
+  assert.equal(result.vmId, 'vm-02')
+  assert.equal(result.selectionReason, 'capacity-spill')
+  assert.ok(Date.now() - start >= 100)
+  assert.ok(Date.now() - start < 240)
+  assert.equal(spilled.has('account-1'), true)
+  assert.deepEqual(pool.stickyRouter.resolve('sess:capacity-turn'), home)
+  assert.deepEqual(pool.stickyRouter.resolve('family2:capacity-turn'), family)
+})
+
+test('capacity replay rejects opaque, thread, tool, unknown, lineage and untrusted caller paths', async (t) => {
+  for (const kind of [
+    'thread',
+    'container',
+    'tool',
+    'thinking',
+    'redacted',
+    'encrypted',
+    'server-tool',
+    'tool-result',
+    'org-state',
+    'unknown',
+    'family',
+    'missing-context',
+    'turn-control',
+    'crag',
+  ]) {
+    await t.test(kind, async (t) => {
+      const pool = await capacityPool(t)
+      const quota = capacityQuota()
+      if (kind === 'thread') quota.body.thread = { type: 'continue', previous_message_id: 'msg_prior' }
+      if (kind === 'container') quota.body.container = 'server-state'
+      if (kind === 'tool') quota.body.messages[1].content = [{ type: 'tool_use', id: 'tool1', name: 'Read', input: {} }]
+      if (kind === 'thinking')
+        quota.body.messages[1].content = [{ type: 'thinking', thinking: 'opaque', signature: 'org-bound' }]
+      if (kind === 'redacted') quota.body.messages[1].content = [{ type: 'redacted_thinking', data: 'opaque' }]
+      if (kind === 'encrypted')
+        quota.body.messages[1].content = [{ type: 'text', text: 'visible', encrypted_content: 'opaque' }]
+      if (kind === 'server-tool') quota.body.tools = [{ type: 'web_search_20250305', name: 'web_search' }]
+      if (kind === 'tool-result')
+        quota.body.messages[2].content = [{ type: 'tool_result', tool_use_id: 'tool1', content: 'result' }]
+      if (kind === 'org-state')
+        quota.body.metadata = { user_id: JSON.stringify({ session_id: 'capacity-turn', org_uuid: 'org-bound' }) }
+      if (kind === 'unknown') quota.body.future_server_state = 'opaque'
+      // Trusted lineage rejection is exercised through runOnce below.
+      // Omitted internal permission retains the old caller contract.
+      if (kind === 'turn-control') quota.body.messages[1].clear_at = 'server-turn'
+      if (kind === 'crag') {
+        const original = pool.eligibleCandidates.bind(pool)
+        pool.eligibleCandidates = async (args) => {
+          const cs = await original(args)
+          for (const c of cs) c.vm.dataplane = 'crag'
+          return cs
+        }
+      }
+      const result = await seat(pool, 'capacity-turn', {
+        stickyKey: 'sess:capacity-turn',
+        familyVmId: 'vm-01',
+        quotaRequest: quota,
+        capacityBorrowAllowed: !['family', 'missing-context'].includes(kind),
+        deadline: Date.now() + 60,
+      })
+      t.after(() => result.release?.())
+      assert.equal(result.ok, false)
+      assert.equal(pool.planner.openCount('vm-02'), 0)
+    })
+  }
+})
+
+test('capacity replay never splits a held seat and respects total deadline when all seats stay full', async (t) => {
+  const pool = await capacityPool(t)
+  const held = await seat(pool, 'capacity-turn', { deviceVmId: 'vm-02', allowWait: false })
+  t.after(() => held.release())
+  const result = await seat(pool, 'capacity-turn', {
+    stickyKey: 'sess:capacity-turn',
+    quotaRequest: capacityQuota(),
+    capacityBorrowAllowed: true,
+    deadline: Date.now() + 70,
+  })
+  t.after(() => result.release?.())
+  assert.equal(result.vmId, 'vm-02')
+  assert.notEqual(result.selectionReason, 'capacity-spill')
+  result.release()
+  held.release()
+  // Fill both VMs; global phase must use the original remaining budget.
+  const other = await seat(pool, 'capacity-other', { deviceVmId: 'vm-02', allowWait: false })
+  assert.equal(other.ok, true)
+  t.after(() => other.release())
+  const start = Date.now()
+  const timed = await seat(pool, 'capacity-wait', {
+    stickyKey: 'sess:capacity-turn',
+    familyVmId: 'vm-01',
+    quotaRequest: capacityQuota(),
+    capacityBorrowAllowed: true,
+    deadline: start + 100,
+  })
+  assert.equal(timed.ok, false)
+  assert.ok(Date.now() - start < 180)
+})
+
+test('capacity replay through real runner preserves session family device and outbound home on all bind phases', async (t) => {
+  const pool = await capacityPool(t)
+  const sticky = pool.stickyRouter
+  sticky.bind('dev2:capacity-device', { accountId: 'account-1', vmId: 'vm-01' })
+  const runner = new FailoverRunner({ scheduler: pool, stickyRouter: sticky, config: { total_retry_deadline_ms: 220 } })
+  let executions = 0
+  const home = sticky.resolve('sess:capacity-turn')
+  const family = sticky.resolve('family2:capacity-turn')
+  const device = sticky.resolve('dev2:capacity-device')
+  const rowsBefore = structuredClone(sticky.repo.all())
+  const result = await runner.run({
+    requestId: 'capacity-real-runner',
+    canonicalBody: capacityHistory(),
+    model: MODEL,
+    stickyKey: 'sess:capacity-turn',
+    stickyKeys: ['sess:capacity-turn'],
+    seatKey: 'seat:sess:capacity-turn',
+    familyKey: 'family2:capacity-turn',
+    familyVmId: 'vm-01',
+    deviceKey: 'dev2:capacity-device',
+    quotaRequest: capacityQuota(),
+    capacityBorrowAllowed: true,
+    applyAttempt: async (body, selected, extra) => {
+      assert.equal(selected.selectionReason, 'capacity-spill')
+      assert.equal(extra.stickyBound.sessionId, 'original-cli-session')
+      assert.deepEqual(sticky.resolve('sess:capacity-turn'), home)
+      return { body, meta: { sessionId: 'borrowed-cold-session' } }
+    },
+    callAttempt: async ({ candidate }) => {
+      executions++
+      assert.equal(candidate.vmId, 'vm-02')
+      assert.deepEqual(sticky.resolve('sess:capacity-turn'), home)
+      return {
+        ok: true,
+        status: 200,
+        terminalState: 'verified',
+        body: { type: 'message', content: [{ type: 'text', text: 'violet' }], stop_reason: 'end_turn', usage: {} },
+      }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(executions, 1)
+  assert.deepEqual(sticky.resolve('sess:capacity-turn'), home)
+  assert.deepEqual(sticky.resolve('family2:capacity-turn'), family)
+  assert.deepEqual(sticky.resolve('dev2:capacity-device'), device)
+  assert.deepEqual(sticky.repo.all(), rowsBefore)
+  assert.equal(pool.planner.seatOf(planned('capacity-turn')), null)
+})
+
+test('capacity replay global phase does not jump an earlier global waiter', async (t) => {
+  const pool = await capacityPool(t)
+  const blocker = await seat(pool, 'capacity-vm2-blocker', { deviceVmId: 'vm-02', allowWait: false })
+  assert.equal(blocker.ok, true)
+  t.after(() => blocker.release())
+  const earlierPromise = seat(pool, 'capacity-earlier', { deadline: Date.now() + 700 })
+  await waitFor(() => pool.planner.globalQueue.length === 1)
+  let borrowedFinished = false
+  const borrowedPromise = seat(pool, 'capacity-turn', {
+    stickyKey: 'sess:capacity-turn',
+    familyVmId: 'vm-01',
+    quotaRequest: capacityQuota(),
+    capacityBorrowAllowed: true,
+    deadline: Date.now() + 600,
+  }).then((result) => {
+    borrowedFinished = true
+    return result
+  })
+  await waitFor(() => pool.planner.globalQueue.length === 2)
+  blocker.release()
+  const earlier = await earlierPromise
+  t.after(() => earlier.release?.())
+  assert.equal(earlier.ok, true)
+  assert.equal(earlier.vmId, 'vm-02')
+  assert.equal(borrowedFinished, false)
+  earlier.release()
+  const borrowed = await borrowedPromise
+  t.after(() => borrowed.release?.())
+  assert.equal(borrowed.ok, true)
+  assert.equal(borrowed.selectionReason, 'capacity-spill')
+})
+
+test('capacity replay failure reports borrowed credential death without deleting original home or family DB rows', async (t) => {
+  const pool = await capacityPool(t)
+  const sticky = pool.stickyRouter
+  const before = structuredClone(sticky.repo.all())
+  const runner = new FailoverRunner({ scheduler: pool, stickyRouter: sticky, config: { total_retry_deadline_ms: 220 } })
+  const result = await runner.run({
+    requestId: 'borrowed-credential-failure',
+    canonicalBody: capacityHistory(),
+    model: MODEL,
+    stickyKey: 'sess:capacity-turn',
+    seatKey: 'seat:sess:capacity-turn',
+    familyKey: 'family2:capacity-turn',
+    familyVmId: 'vm-01',
+    callAttempt: async () => ({
+      ok: false,
+      status: 401,
+      terminalState: 'rejected',
+      body: { error: { message: 'OAuth access token has been revoked' } },
+    }),
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.policy.reason, 'oauth_revoked')
+  assert.deepEqual(sticky.repo.all(), before)
+})
+
+test('capacity replay zero-execution retry resumes global FIFO without a second home wait', async (t) => {
+  const pool = await capacityPool(t, [{ id: 'vm-03', policy: { sessionSlots: 1 } }])
+  const before = structuredClone(pool.stickyRouter.repo.all())
+  const selections = []
+  const tickets = []
+  const select = pool.selectAndReserve.bind(pool)
+  const enqueue = pool.enqueueTicket.bind(pool)
+  pool.selectAndReserve = async (args) => {
+    selections.push({
+      allowed: args.capacityBorrowAllowed,
+      continuation: args.capacityBorrowContinuation,
+      deadline: args.deadline,
+    })
+    return select(args)
+  }
+  pool.enqueueTicket = (args) => {
+    tickets.push(args.kind)
+    return enqueue(args)
+  }
+  const runner = new FailoverRunner({
+    scheduler: pool,
+    stickyRouter: pool.stickyRouter,
+    config: { total_retry_deadline_ms: 700, same_account_retry_delay_ms: 0 },
+  })
+  const served = []
+  const result = await runner.run({
+    requestId: 'capacity-zero-execution-retry',
+    canonicalBody: capacityHistory(),
+    model: MODEL,
+    stickyKey: 'sess:capacity-turn',
+    seatKey: 'seat:sess:capacity-turn',
+    familyKey: 'family2:capacity-turn',
+    familyVmId: 'vm-01',
+    callAttempt: async ({ candidate }) => {
+      served.push(candidate.vmId)
+      assert.deepEqual(pool.stickyRouter.repo.all(), before)
+      if (served.length === 1)
+        return {
+          ok: false,
+          status: 503,
+          upstreamExecutions: 0,
+          terminalState: 'rejected',
+          body: { error: { type: 'api_error', code: 'slot_busy', message: 'no free slot' } },
+        }
+      return {
+        ok: true,
+        status: 200,
+        terminalState: 'verified',
+        body: { type: 'message', content: [{ type: 'text', text: 'violet' }], stop_reason: 'end_turn', usage: {} },
+      }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.deepEqual(served, ['vm-02', 'vm-03'])
+  assert.equal(result.attemptCount, 1, 'zero-execution miss does not count as an upstream execution')
+  assert.equal(tickets.filter((kind) => kind === 'seat').length, 1, 'only the first selection may wait on home')
+  assert.ok(tickets.slice(1).every((kind) => kind === 'global'))
+  assert.ok(tickets.includes('global'), 'retry really enters the global FIFO, not just a broad immediate scan')
+  assert.equal(selections[0].allowed, true)
+  assert.equal(selections[0].continuation, false)
+  assert.ok(selections.slice(1).every((item) => item.allowed === false && item.continuation === true))
+  assert.ok(selections.every((item) => item.deadline === selections[0].deadline))
+  assert.deepEqual(pool.stickyRouter.repo.all(), before)
+  assert.equal(pool.planner.seatOf(planned('capacity-turn')), null)
 })

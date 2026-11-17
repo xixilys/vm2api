@@ -12,6 +12,22 @@
 
 健康结果按 VM 和账号合并并发探测，使用完成时间计算 TTL。取消一个调用不会取消其他调用共享的探测。健康写回和过期清理由后台任务完成；心跳只更新运行状态表，并保护较新的心跳、凭证禁用和模型冷却。热重建调度器时停止旧维护定时器。
 
+## 新会话、设备与账号亲和
+
+独立新会话按现有 priority 等级、实际已开席位占容量的比例选择 VM；同设备只在同等级、同占用率候选间优先。不把同设备的新会话当作父子会话，也不因设备原 VM 已满而阻断其它合格 VM。全池已满时进入原全局队列。
+
+继续会话保留原账号；明确解析到父/root 账号的子会话与 companion 分别占席位，但保持父账号。没有明确父关系的 companion 不用设备最近会话推断父账号。这里不改默认 priority、等级自动计算、权限/模型/额度筛选、物理席位及并发上限，也不搬动正在执行或仍持有席位的请求。
+
+### 纯文本完整历史的有界容量借槽
+
+`FailoverRunner` 仅为规范独立 root 会话开启内部容量借槽资格；旧调用者默认关闭。还须同时满足：未发生上游执行、没有 held seat 或已绑定槽索引、没有显式父/companion 关系或诊断 pin、`session_affinity_first=false`，且原账号确因席位/并发容量等待。仅覆盖已识别的 wrap/cli-node/native-messages 完整历史路径；CRAG、未知运行时不借槽。
+
+请求体只接受至少三条、首尾为 user 的完整纯文本 Messages 历史及已知无状态字段；工具、thinking/加密块、thread、continuation、container、服务端状态和未知字段均不开放借槽。不会通过剥离工具或 thinking 来获得资格。完整历史冷导入是这一子集的执行前提，不把只有文本的 delta 当完整历史。
+
+原 home 最多等待 `min(sticky_wait_timeout_ms, 剩余总预算 / 2)`，到期后才展开直连 home 的单候选限制，进入原 fallback/global FIFO 和实时原子 reservation。沿用同一绝对请求 deadline，不增加总重试时间；借槽后的零执行 `slot_busy` 重试继续剩余 global 阶段，不重新等待半份 home 预算。仍按原 priority、权限、模型、额度与容量准入。
+
+借槽是本次请求的临时执行位置：保留原 session/family/device 绑定及 TTL，不清 pin、历史或缓存。长队列中的工具/thinking/未知状态请求继续保留粘性；已有队列不会因本次规则立即清空。不同账号可能无法复用原账号的前缀缓存，因此该规则不保证缓存命中率或模型吞吐提高。
+
 ## 计时口径
 
 - `wait_ms`：已有的总调度耗时。
@@ -40,3 +56,15 @@ node --test test/unit/pool-scheduler.test.mjs test/unit/seat-planner.test.mjs \
   test/unit/quota-critical-band.test.mjs test/unit/account-quota.test.mjs \
   test/unit/pool-runtime-repos.test.mjs test/unit/scheduler-fastpath.test.mjs
 ```
+
+## 独立新会话的 main135 对照
+
+基线：`e39a7e53652313e2a5d1e408ce3be90380843ed3`（v1.4.135）。Node v22.23.5，macOS，同一进程、相同依赖；实际 PoolScheduler/SeatPlanner，候选筛选及执行 reservation 使用合成 fixture，不访问网络、账号或真实配置。两个同 priority=4、seatCap=4 的 VM，设备偏好第一个 VM。每类预热 500 次，五轮交替基线/候选顺序，每轮 3000 次；每次完成即释放席位。
+
+| 场景 | main135 耗时中位数（µs/选择） | 本修改（µs/选择） | main135 / 本修改成功数 |
+|---|---:|---:|---:|
+| 复用已有席位 | 1.544 | 1.501 | 15000 / 15000 |
+| 新会话，两台均空闲 | 2.478 | 2.430 | 15000 / 15000 |
+| 设备原 VM 四席已满、另一台空闲 | 2.807 | 2.493 | 0 / 15000 |
+
+该对照说明原先被设备亲和阻断的新会话可以使用其它合格席位，未显示选择耗时增加。它不测数据库、真实排队、模型吞吐或缓存命中率；微秒级差异不作为显著加速结论。每轮 CPU 时间中位数在已有席位场景由 4.596 ms 升至 6.603 ms，空闲新会话由 6.419 ms 升至 6.891 ms，满设备场景由 11.157 ms 降至 6.269 ms；不据此宣称全面 CPU 改善。上文 SQLite 的 48→2 结果属于原快照优化，不是本次对照的收益。

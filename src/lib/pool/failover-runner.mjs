@@ -722,12 +722,15 @@ export class FailoverRunner {
     let currentDeviceVmId = null
     let pinnedSlot = null
     let lastSelected = null
+    let capacityBorrowed = false
     const attribution = () => ({
       accountId: lastSelected?.accountId,
       vmId: lastSelected?.vmId,
       attemptCount: budget.hops,
     })
     const bindAll = (account, opts) => {
+      // A capacity loan never writes session/family/device rows, including TTLs.
+      if (capacityBorrowed) return
       if (!this.stickyRouter || !account) return
       const sessionId = account.sessionId || (account.accountId === outboundSessionAccountId ? outboundSessionId : '')
       const payload = { accountId: account.accountId, vmId: account.vmId }
@@ -777,6 +780,7 @@ export class FailoverRunner {
     // put this session back into session_slots. VM / account memory and its
     // original sticky expiry stay.
     const releaseStickySlots = () => {
+      if (capacityBorrowed) return
       if (!this.stickyRouter?.bind) return
       for (const key of bindKeys) {
         if (pinMoved(key)) continue
@@ -833,7 +837,23 @@ export class FailoverRunner {
       let selected = null
       try {
         currentDeviceVmId = deviceKey ? this.stickyRouter?.resolve?.(deviceKey)?.vmId || null : null
+        const sessionId = typeof stickyKey === 'string' && stickyKey.startsWith('sess:') ? stickyKey.slice(5) : ''
+        const ownSession = !!sessionId && this.stickyRouter?.canonicalSessionKey?.(sessionId) === stickyKey
+        const ownFamily = ownSession ? this.stickyRouter?.canonicalFamilyKey?.(sessionId) : null
+        const familyHome = familyKey ? this.stickyRouter?.resolve?.(familyKey) : null
         const selectArgs = {
+          // Only a canonical independent root may lend its pre-execution wait.
+          // Children/companions have a different family key or no seated key.
+          capacityBorrowContinuation: capacityBorrowed && budget.hops === 0,
+          capacityBorrowAllowed:
+            !capacityBorrowed &&
+            budget.hops === 0 &&
+            ownSession &&
+            seatKey === `seat:${this.stickyRouter.canonicalSessionKey(sessionId)}` &&
+            !skipSessionSeat &&
+            !pinVmId &&
+            ((!familyKey && !familyVmId) ||
+              (familyKey === ownFamily && !!familyHome && familyHome.vmId === familyVmId)),
           model,
           stickyKey,
           stickyKeys: bindKeys,
@@ -933,6 +953,7 @@ export class FailoverRunner {
         snapshotPins()
         const attemptStickyBound = pinBaseline.get(stickyKey) || null
         lastSelected = selected
+        if (selected.selectionReason === 'capacity-spill') capacityBorrowed = true
         pinnedSlot = selected.slotIndex ?? null
         if (selected.seatMoved) seatMovedTo = selected.vmId
         bindAll(
@@ -1152,7 +1173,7 @@ export class FailoverRunner {
         applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
         if (policy.pauseSchedule) this.pauseUnit(selected, policy, result)
         if (!pinVmId && isCredentialDeath(policy)) {
-          this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
+          this.forgetCredential(selected, policy, { familyKey, sessionKeys: capacityBorrowed ? [] : bindKeys })
           if (familyKey) {
             releaseStickySlots()
             return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
@@ -1284,7 +1305,7 @@ export class FailoverRunner {
         }
         applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
         if (!pinVmId && isCredentialDeath(policy)) {
-          this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
+          this.forgetCredential(selected, policy, { familyKey, sessionKeys: capacityBorrowed ? [] : bindKeys })
           if (familyKey) {
             releaseStickySlots()
             return { ...result, ...attribution(), finalState: result.terminalState, policy }

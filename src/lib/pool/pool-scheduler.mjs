@@ -50,6 +50,7 @@ import {
   supportsGatewayPolicy,
 } from '../transport/rust-kernel-client.mjs'
 import { resolveSessionSlots } from '../vm/slot-engine.mjs'
+import { cragV2KernelActive, readSlotKernelConfig } from '../protocol/crag-print-prompt.mjs'
 import { SeatPlanner, rankSeatCandidates } from './seat-planner.mjs'
 import { GATE_DRAINING } from './quota-gate.mjs'
 import { activeHoursOf, evaluateActiveHours } from './active-hours.mjs'
@@ -57,6 +58,103 @@ import { vmNodeDataPath } from '../cluster/placement.mjs'
 import { GATE_DIAL_TIMEOUT_MS } from '../cluster/direct-link.mjs'
 import { ErrorCode } from '../core/errors.mjs'
 import { HOST_PRESSURE_CRITICAL, HOST_PRESSURE_OK, hostMemoryLevelForVm } from '../cluster/host-memory-pressure.mjs'
+
+// runOnce supplies canonical lineage permission; older callers default off.
+// This additional body gate is deliberately narrower than the Messages schema.
+function plainCapacityHistory(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false
+  const top = new Set([
+    'model',
+    'max_tokens',
+    'messages',
+    'system',
+    'metadata',
+    'thinking',
+    'stream',
+    'temperature',
+    'top_p',
+    'top_k',
+    'stop_sequences',
+    'cache_control',
+  ])
+  if (Object.keys(body).some((key) => !top.has(key))) return false
+  const cache = (value) =>
+    value == null ||
+    (value.type === 'ephemeral' &&
+      Object.keys(value).every((key) => key === 'type' || key === 'ttl') &&
+      (value.ttl == null || value.ttl === '5m' || value.ttl === '1h'))
+  const text = (content) =>
+    typeof content === 'string' ||
+    (Array.isArray(content) &&
+      content.every(
+        (block) =>
+          block?.type === 'text' &&
+          typeof block.text === 'string' &&
+          Object.keys(block).every((key) => ['type', 'text', 'cache_control'].includes(key)) &&
+          cache(block.cache_control),
+      ))
+  if (!cache(body.cache_control) || (body.system != null && !text(body.system))) return false
+  if (
+    body.thinking != null &&
+    (body.thinking.type !== 'disabled' || Object.keys(body.thinking).some((key) => key !== 'type'))
+  )
+    return false
+  if (body.metadata != null) {
+    if (
+      typeof body.metadata !== 'object' ||
+      Array.isArray(body.metadata) ||
+      Object.keys(body.metadata).some((key) => key !== 'user_id')
+    )
+      return false
+    if (body.metadata.user_id != null) {
+      let identity
+      try {
+        identity = JSON.parse(body.metadata.user_id)
+      } catch {
+        return false
+      }
+      if (
+        !identity ||
+        typeof identity !== 'object' ||
+        Array.isArray(identity) ||
+        Object.keys(identity).some((key) => !['session_id', 'device_id', 'account_uuid'].includes(key)) ||
+        Object.values(identity).some((value) => typeof value !== 'string')
+      )
+        return false
+    }
+  }
+  return (
+    Array.isArray(body.messages) &&
+    body.messages.length >= 3 &&
+    body.messages[0]?.role === 'user' &&
+    body.messages.at(-1)?.role === 'user' &&
+    body.messages.every(
+      (message) =>
+        ['user', 'assistant'].includes(message?.role) &&
+        Object.keys(message).every((key) => key === 'role' || key === 'content') &&
+        text(message.content),
+    )
+  )
+}
+
+function capacityWrapCandidate(planner, candidate) {
+  if (!candidate) return false
+  const health = planner.healthCache.get(candidate.vmId)?.value
+  const config = readSlotKernelConfig(candidate.exec?.homeDir)
+  const variants = [
+    health?.runtime_variant,
+    health?.dataplane,
+    config?.runtime_variant,
+    config?.dataplane,
+    candidate.vm?.dataplane,
+  ].filter(Boolean)
+  // A tested wrap path, not an inferred global default or an unknown worker.
+  return (
+    variants.length > 0 &&
+    variants.every((variant) => ['wrap', 'cli-node', 'native-messages'].includes(variant)) &&
+    !cragV2KernelActive({ vm: candidate.vm, health, kernelConfig: config })
+  )
+}
 
 const WAIT_TIMEOUT_MIN_MS = 1000
 const WAIT_TIMEOUT_MAX_MS = 120000
@@ -201,18 +299,20 @@ function sessionIdFromStickyKey(key) {
   return body.slice('sess:'.length)
 }
 
-/** Soft affinity for new sessions: machine, then family. */
-function seatHomes({ deviceVm = '', familyVm = '' } = {}) {
-  const homes = [
-    { vmId: String(deviceVm || '').trim(), reason: 'device-affinity' },
-    { vmId: String(familyVm || '').trim(), reason: 'family-affinity' },
-  ]
-  const seen = new Set()
-  return homes.filter((home) => {
-    if (!home.vmId || seen.has(home.vmId)) return false
-    seen.add(home.vmId)
-    return true
-  })
+/** Keep the existing rank; device affinity only precedes its occupancy peers. */
+function rankNewSeatCandidates(planner, candidates, deviceVmId = '') {
+  const ranked = planner.rank(candidates)
+  const at = ranked.findIndex((candidate) => candidate.vmId === deviceVmId)
+  if (at <= 0) return ranked
+  const home = ranked[at]
+  const occupancy = planner.openCount(home.vmId) / home.seatCap
+  const firstPeer = ranked.findIndex(
+    (candidate) =>
+      candidate.priority === home.priority && planner.openCount(candidate.vmId) / candidate.seatCap === occupancy,
+  )
+  ranked.splice(at, 1)
+  ranked.splice(firstPeer, 0, home)
+  return ranked
 }
 
 /**
@@ -896,12 +996,19 @@ export class PoolScheduler extends EventEmitter {
     ownerScope = PLATFORM_SCOPE,
     keyScope = null,
     quotaRequest = null,
+    capacityBorrowAllowed = false,
+    capacityBorrowContinuation = false,
   } = {}) {
     const startedAt = Date.now()
     const failoverDeadline = Number(deadline) || Number.POSITIVE_INFINITY
     const familyVm = familyVmId ? String(familyVmId).trim() : ''
     const machineKey = String(deviceKey || '').trim()
     const avoided = (candidate) => !!avoid?.size && (avoid.has(candidate.accountId) || avoid.has(candidate.vmId))
+    const replayBody = (capacityBorrowAllowed || capacityBorrowContinuation) && plainCapacityHistory(quotaRequest?.body)
+    const beganWithSeat = !!this.planner.seatOf(seatKey)
+    let borrowHome = null
+    let capacitySpill = false
+    let capacityWait = false
     let stickyCleared = false
     let familyGated = false
     let seatMoved = false
@@ -935,10 +1042,12 @@ export class PoolScheduler extends EventEmitter {
       // Keep the granting phase across rehome; legacy workers retain the relative wait.
       const phaseDeadline = ticket?.grantedDeadline
       const sticky = ['seat-held', 'sticky', 'device-affinity', 'family-affinity'].includes(granted.selectionReason)
+      const borrowed = capacitySpill && borrowHome && granted.candidate.accountId !== borrowHome.accountId
+      if (borrowed) spilled.add(borrowHome.accountId)
       const result = {
         ...granted.candidate,
         ...granted.reservation,
-        selectionReason: granted.selectionReason,
+        selectionReason: borrowed ? 'capacity-spill' : granted.selectionReason,
         seatKey,
         seatMoved: seatMoved && granted.seatOpened,
         familyGated,
@@ -992,7 +1101,7 @@ export class PoolScheduler extends EventEmitter {
         if (ticket?.granted) return finish(ticket.granted)
         const home = this.clusterHome(candidates, { stickyKey, held, familyVmId, avoid })
         const recovering = home?.offline ? home : null
-        if (recovering) {
+        if (recovering && !capacityBorrowContinuation) {
           recoveringVm = recovering
           const queuedAt = Date.now()
           const deadline = Math.min(
@@ -1009,7 +1118,40 @@ export class PoolScheduler extends EventEmitter {
           continue
         }
         if (!checkedHomeOnly && familyVm && !this.hasClusterCandidate(candidates, familyVm)) familyGated = true
-        candidates = this.preferClusterHome(candidates, home || recoveringVm)
+        const bound = stickyKey ? this.stickyRouter?.resolve?.(stickyKey) : null
+        const homeCandidate = candidates.find((c) => c.accountId === bound?.accountId && c.vmId === bound?.vmId)
+        const homeAtCapacity =
+          homeCandidate &&
+          (this.planner.openCount(homeCandidate.vmId) >= homeCandidate.seatCap ||
+            homeCandidate.inflight >= homeCandidate.maxConcurrency ||
+            ['concurrency_limit', 'fable_concurrency', 'slot_busy', 'quota_band_inflight'].includes(
+              homeCandidate.waitReason,
+            ))
+        const canBorrow =
+          replayBody &&
+          !beganWithSeat &&
+          !held &&
+          this.config.session_affinity_first === false &&
+          Number.isFinite(failoverDeadline) &&
+          bound &&
+          bound.slotIndex == null &&
+          (!familyVm || familyVm === bound.vmId) &&
+          (capacityBorrowContinuation || capacityWrapCandidate(this, homeCandidate))
+        // A zero-execution miss after a loan resumes this request's global
+        // phase. It must neither narrow to the direct home nor wait half again.
+        if (capacityBorrowContinuation && !canBorrow) return fail('all_accounts_busy')
+        if (
+          capacityBorrowContinuation ||
+          (ticket?.kind === 'seat' && capacityWait && now >= ticket.stickyUntil && canBorrow)
+        ) {
+          borrowHome = bound
+          capacitySpill = true
+        }
+        // Only this proved pre-execution class may expand a direct home.
+        // No timeout tweak can help if preferClusterHome keeps one candidate.
+        candidates = capacitySpill
+          ? candidates.filter((candidate) => capacityWrapCandidate(this, candidate))
+          : this.preferClusterHome(candidates, home || recoveringVm)
         if (now >= failoverDeadline || (ticket && ticket.kind !== 'seat' && now >= ticket.deadline)) {
           return fail('pool_queue_timeout')
         }
@@ -1042,6 +1184,10 @@ export class PoolScheduler extends EventEmitter {
         })
         if (sticky.cleared) stickyCleared = true
         const stickyHome = sticky.match && !sticky.match.draining && !avoided(sticky.match) ? sticky.match : null
+        // familyVmId is a resolved parent/root account, not a device hint.
+        // A child owns its seat but must not borrow a different account merely
+        // because its parent's seat capacity is full.
+        const familyHome = familyGated ? null : byVm.get(familyVm)
         if (ticket?.kind === 'seat') {
           const waitingHome = byVm.get(ticket.vmId)
           const homeUsable =
@@ -1049,9 +1195,17 @@ export class PoolScheduler extends EventEmitter {
             !avoided(waitingHome) &&
             (!waitingHome.busy || stickyShouldWait(waitingHome.waitReason, waitingHome.cooldownReason))
           if (
+            homeUsable &&
+            !capacitySpill &&
+            (familyHome?.vmId === ticket.vmId || capacityBorrowAllowed) &&
+            now >= ticket.stickyUntil
+          ) {
+            return fail('pool_queue_timeout')
+          }
+          if (
             now >= ticket.stickyUntil ||
             !homeUsable ||
-            (waitingHome.vmId !== stickyHome?.vmId &&
+            (waitingHome.vmId !== (stickyHome || familyHome)?.vmId &&
               candidates.some((candidate) => candidate.priority > waitingHome.priority && !avoided(candidate)))
           ) {
             ticket.deadline = Math.min(failoverDeadline, now + this.config.fallback_wait_timeout_ms)
@@ -1080,28 +1234,28 @@ export class PoolScheduler extends EventEmitter {
           this.planner.pump(seat.vmId)
         } else {
           if (!ticket) {
-            const homes = seatHomes({
-              deviceVm: this.machineHome(machineKey) || deviceVmId,
-              familyVm: familyGated ? '' : familyVm,
-            })
-            const granted = this.openNewSeat(seatKey, candidates, {
-              avoided,
-              homes,
-              stickyHome,
-              deviceKey: machineKey,
-            })
+            const deviceVm = this.machineHome(machineKey) || deviceVmId
+            const granted = capacitySpill
+              ? null
+              : this.openNewSeat(seatKey, candidates, {
+                  avoided,
+                  // Retain the existing homes call contract for account affinity.
+                  homes: deviceVm ? [{ vmId: deviceVm, reason: 'device-affinity' }] : [],
+                  deviceVmId: deviceVm,
+                  stickyHome: stickyHome || familyHome,
+                  familyHome: stickyHome ? null : familyHome,
+                  deviceKey: machineKey,
+                })
             if (granted) return finish(granted)
             if (!candidates.length) {
               const empty = emptyPoolFailure(candidates)
               return { ...fail(empty.reason), retry_after_ms: empty.retry_after_ms }
             }
-            if (!allowWait || now >= failoverDeadline) return fail('all_accounts_busy')
-            const waitTier = highestPriorityCandidates(candidates.filter((candidate) => !avoided(candidate)))
-            const home =
-              stickyHome ||
-              homes
-                .map((entry) => waitTier.find((candidate) => candidate.vmId === entry.vmId))
-                .find((candidate) => candidate && (!candidate.busy || stickyShouldWait(candidate.waitReason)))
+            if ((!allowWait && !capacitySpill) || now >= failoverDeadline) return fail('all_accounts_busy')
+            // Independent sessions queue globally immediately. A busy device
+            // hint must not turn them into a 45s wait on that device's VM.
+            const home = capacitySpill ? null : stickyHome || (familyHome && !avoided(familyHome) ? familyHome : null)
+            capacityWait = !!(home && canBorrow && homeAtCapacity)
             ticket = home
               ? this.enqueueTicket({
                   seatKey,
@@ -1110,7 +1264,13 @@ export class PoolScheduler extends EventEmitter {
                   requestDeadline: failoverDeadline,
                   vmId: home.vmId,
                   candidates: byVm,
-                  stickyUntil: Math.min(failoverDeadline, now + this.config.sticky_wait_timeout_ms),
+                  stickyUntil: Math.min(
+                    failoverDeadline,
+                    now +
+                      (capacityWait
+                        ? Math.min(this.config.sticky_wait_timeout_ms, (failoverDeadline - now) / 2)
+                        : this.config.sticky_wait_timeout_ms),
+                  ),
                   deadline: failoverDeadline,
                   avoided,
                 })
@@ -1123,6 +1283,7 @@ export class PoolScheduler extends EventEmitter {
                   candidates: byVm,
                   deadline: Math.min(failoverDeadline, now + this.config.fallback_wait_timeout_ms),
                   avoided,
+                  deviceVmId: deviceVm,
                 })
           } else if (ticket.kind === 'conc') {
             // Its seat moved away: wait for a new seat on the same terms as a new device.
@@ -1132,6 +1293,7 @@ export class PoolScheduler extends EventEmitter {
           for (const vmId of ticket.vmId ? [ticket.vmId] : byVm.keys()) this.planner.pump(vmId)
         }
         if (ticket.granted) return finish(ticket.granted)
+        if (!allowWait) return fail('all_accounts_busy')
         if (Date.now() >= failoverDeadline) return fail('pool_queue_timeout')
         const until = ticket.kind === 'seat' ? ticket.stickyUntil : ticket.deadline
         await this.waitTicket(ticket, { signal, until: Math.min(until, Date.now() + QUEUE_REFRESH_MS) })
@@ -1165,45 +1327,52 @@ export class PoolScheduler extends EventEmitter {
 
   /**
    * A continuing session keeps its home even if a higher level has room.
-   * New sessions try levels in descending order, with soft affinity within a level.
+   * Parent/root families keep their account with separate seats. Independent
+   * sessions follow priority and occupancy; a device only breaks occupancy ties.
    */
-  openNewSeat(seatKey, candidates, { avoided, homes = [], stickyHome = null, deviceKey = '' }) {
+  openNewSeat(seatKey, candidates, { avoided, homes = [], deviceVmId, stickyHome = null, familyHome, deviceKey = '' }) {
+    // Existing homes-only callers may have deduplicated equal device/family
+    // VMs. Preserve their ambiguous affinity; explicit familyHome (including
+    // null) distinguishes independent placement from an account-bound family.
+    const legacyDevice = deviceVmId === undefined && familyHome === undefined
+    deviceVmId ??= homes.find((home) => home.reason === 'device-affinity')?.vmId || ''
+    familyHome ??= candidates.find((candidate) =>
+      homes.some((home) => home.reason === 'family-affinity' && home.vmId === candidate.vmId),
+    )
     const openable = this.openableCandidates(candidates, avoided)
-    if (stickyHome) {
-      if (!openable.includes(stickyHome)) return null
-      return this.claimSeat(seatKey, stickyHome, 'sticky', deviceKey)
+    const home = stickyHome || familyHome
+    if (home) {
+      if (!openable.includes(home)) return null
+      return this.claimSeat(seatKey, home, familyHome ? 'family-affinity' : 'sticky', deviceKey)
     }
-    const ranked = this.planner.rank(openable)
+    const ranked = rankNewSeatCandidates(this.planner, openable, deviceVmId)
     for (const priority of new Set(ranked.map((candidate) => candidate.priority))) {
       const tier = ranked.filter((candidate) => candidate.priority === priority)
-      const homeFull = candidates.some(
-        (candidate) =>
-          candidate.priority === priority &&
-          !avoided(candidate) &&
-          homes.some((home) => home.vmId === candidate.vmId) &&
-          this.planner.openCount(candidate.vmId) >= candidate.seatCap,
-      )
+      const legacyHomeFull =
+        legacyDevice &&
+        candidates.some(
+          (candidate) =>
+            candidate.vmId === deviceVmId &&
+            candidate.priority === priority &&
+            !avoided(candidate) &&
+            this.planner.openCount(candidate.vmId) >= candidate.seatCap,
+        )
       // Host memory: machines with room first, then tight ones. A continuing
       // conversation (sticky home) keeps its VM whatever the pressure.
       for (const strict of [true, false]) {
         for (const draining of [false, true]) {
           const group = tier.filter((candidate) => candidate.draining === draining)
-          for (const home of homes) {
-            const match = group.find((candidate) => candidate.vmId === home.vmId)
-            if (!match || !hostAdmits(match, strict)) continue
-            const granted = this.claimSeat(seatKey, match, home.reason, deviceKey)
-            if (granted) return granted
-          }
-          if (homeFull) continue
+          if (legacyDevice) group.sort((a, b) => Number(b.vmId === deviceVmId) - Number(a.vmId === deviceVmId))
           for (const candidate of group) {
-            if (homes.some((home) => home.vmId === candidate.vmId)) continue
+            if (legacyHomeFull && candidate.vmId !== deviceVmId) continue
             if (!hostAdmits(candidate, strict)) continue
-            const granted = this.claimSeat(seatKey, candidate, this.planner.strategy, deviceKey)
+            const reason = candidate.vmId === deviceVmId ? 'device-affinity' : this.planner.strategy
+            const granted = this.claimSeat(seatKey, candidate, reason, deviceKey)
             if (granted) return granted
           }
         }
       }
-      if (homeFull) return null
+      if (legacyHomeFull) return null
     }
     return null
   }
@@ -1251,7 +1420,18 @@ export class PoolScheduler extends EventEmitter {
     }
   }
 
-  enqueueTicket({ signal, seatKey, kind, vmId, candidates, deadline, stickyUntil = null, requestDeadline, avoided }) {
+  enqueueTicket({
+    signal,
+    seatKey,
+    kind,
+    vmId,
+    candidates,
+    deadline,
+    stickyUntil = null,
+    requestDeadline,
+    avoided,
+    deviceVmId = '',
+  }) {
     if (this.queuedTotal() >= this.config.queue_max) throw this.queueFullError([...candidates.keys()])
     const ticket = {
       seatKey,
@@ -1277,20 +1457,22 @@ export class PoolScheduler extends EventEmitter {
         // the granting phase before its deadline is replaced.
         const grantingDeadline = ticket.kind === 'seat' ? ticket.stickyUntil : ticket.deadline
         const target = ticket.candidates.get(id)
-        const higher =
+        const preferred =
           ticket.kind === 'global' && target
-            ? this.planner.rank(
+            ? rankNewSeatCandidates(
+                this.planner,
                 [...ticket.candidates.values()].filter(
                   (candidate) =>
-                    candidate.priority > target.priority &&
+                    candidate.priority >= target.priority &&
                     !avoided?.(candidate) &&
                     !this.planner.hasSeatWaiters(candidate.vmId, { before: ticket }) &&
                     !this.planner.hasConcWaiters(candidate.vmId),
                 ),
+                deviceVmId,
               )
             : []
         let granted = null
-        for (const candidate of [...higher, target]) {
+        for (const candidate of new Set([...preferred, target])) {
           if (!candidate || (ticket.kind === 'global' && avoided?.(candidate))) continue
           granted = this.claimSeat(ticket.seatKey, candidate, 'queued')
           if (granted) break
